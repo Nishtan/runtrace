@@ -10,8 +10,10 @@ const INTERPOLATION_STEP_METERS = 8;
 const GPS_TIMEOUT_MS = 15000;
 
 // Jitter filter — ignore GPS points closer than this or with too-high accuracy error
-const MIN_DISTANCE_METERS = 3;
-const MAX_ACCURACY_METERS = 25;
+const MIN_DISTANCE_METERS = 4;
+const MAX_ACCURACY_METERS = 20;
+// Reject points that imply physically impossible speed (catches big GPS jumps)
+const MAX_RUNNER_SPEED_KMH = 35;
 
 // Loop detection — segment intersection approach
 const LOOP_SKIP_RECENT_SEGS = 4;   // skip last N segments when checking (avoids adjacent false positives)
@@ -21,7 +23,9 @@ const LOOP_COOLDOWN_MS = 8000;     // don't fire two loop alerts within this win
 // ─── Kalman filter for GPS smoothing ─────────────────────────────────────────
 // A simple 1-D Kalman per axis. Tames GPS jitter without adding dependencies.
 function makeKalman() {
-  return { q: 3e-5, r: 0.01, x: null, p: 1 };
+  // q = process noise (how fast reality can change), r = measurement noise (how noisy GPS is)
+  // Higher r = more smoothing, less jitter, slightly more lag — good for walking/running
+  return { q: 3e-5, r: 0.08, x: null, p: 1 };
 }
 function kalmanStep(k, measurement) {
   if (k.x === null) { k.x = measurement; return measurement; }
@@ -343,20 +347,33 @@ export default function RunTraceH3React() {
       if (mapRef.current) mapRef.current.setView([lat, lng], 17);
     }
 
-    // ── 4. Speed / pace ──
-    const speedFromSensor = speed ? speed * 3.6 : 0;
-    speedKmhRef.current = speedFromSensor;
-    setSpeedKmh(speedKmhRef.current);
-    setPaceStr(paceFromSpeedKmh(speedKmhRef.current));
+    // ── 4. Update runner dot position (always, so dot doesn't freeze while paused) ──
     setCurrentPos(point);
 
-    if (!runningRef.current) return; // don't record if paused / idle
+    // ── 5. Speed from device sensor (only show when running) ──
+    if (runningRef.current) {
+      const speedFromSensor = speed ? speed * 3.6 : 0;
+      speedKmhRef.current = speedFromSensor;
+      setSpeedKmh(speedKmhRef.current);
+      setPaceStr(paceFromSpeedKmh(speedKmhRef.current));
+    }
 
-    // ── 5. Minimum distance gate — discard GPS jitter ──
+    // Stop recording if paused or idle
+    if (!runningRef.current) return;
+
+    // ── 6. Minimum distance gate — discard GPS jitter / stationary wobble ──
     const prev = lastPosRef.current;
     if (prev && metersBetween(prev, point) < MIN_DISTANCE_METERS) return;
 
-    // ── 6. Accept point ──
+    // ── 7. Speed sanity gate — reject GPS jumps implying impossible movement ──
+    if (prev) {
+      const dtSeconds = Math.max(0.001, (ts - prev.ts) / 1000);
+      const distM = metersBetween(prev, point);
+      const impliedKmh = (distM / dtSeconds) * 3.6;
+      if (impliedKmh > MAX_RUNNER_SPEED_KMH) return;
+    }
+
+    // ── 8. Accept point ──
     lastPosRef.current = point;
 
     // Distance accounting
@@ -383,7 +400,7 @@ export default function RunTraceH3React() {
     // Set projection origin on first accepted point
     if (!originRef.current) originRef.current = point;
 
-    // ── 7. Build flat-meter segment & check for loop ──
+    // ── 9. Build flat-meter segment & check for loop ──
     const trail = coordTrailRef.current;
     if (trail.length >= 2) {
       const p1 = trail[trail.length - 2];
@@ -394,7 +411,7 @@ export default function RunTraceH3React() {
       checkLoopIntersection();
     }
 
-    // ── 8. H3 densification (for hex cell rasterisation) ──
+    // ── 10. H3 densification (for hex cell rasterisation) ──
     if (prev) {
       const samples = interpolatePoints(prev, point, INTERPOLATION_STEP_METERS);
       for (const sample of samples) appendH3Sample(sample);
@@ -435,20 +452,21 @@ export default function RunTraceH3React() {
       if (!ip) continue;
 
       // ── Build loop polygon in flat-meter space ──
-      // segs[i] starts at trail[i], segs[n-1] ends at trail[n]
-      // loop = ip → trail[i+1] → … → trail[n-1] → trail[n] → ip
+      // segs[i] goes from trail[i] → trail[i+1]
+      // segs[n-1] goes from trail[n-1] → trail[n]  (trail has n+1 points after push)
+      // Loop: ip → trail[i+1] → … → trail[n-1] → trail[n] → back to ip
+      // Do NOT push ip twice — Leaflet's Polygon closes it automatically
       const loopMetersPoints = [
         ip,
         ...trail.slice(i + 1).map((p) => toMeters(p, originRef.current)),
-        ip,
       ];
 
       // ── Count H3 cells inside the loop (Option B: center OR corner overlap) ──
+      // Use the open polygon (no duplicate closing point) — pointInPoly handles wrap-around
       const hexRadiusM = H3_RES_RADIUS_M[H3_RESOLUTION] ?? 25;
       const h3Samples = h3TrailRef.current;
       const enclosedCells = new Set();
 
-      // Build a unique set of cells to test
       const uniqueCellsToTest = new Map();
       h3Samples.forEach((s) => {
         if (!uniqueCellsToTest.has(s.cell)) {
@@ -456,6 +474,31 @@ export default function RunTraceH3React() {
         }
       });
 
+      // Also scan a grid of h3 cells in the bounding box of the loop
+      // so cells the runner didn't visit (interior cells) are also counted
+      const allMpts = loopMetersPoints;
+      const bboxMinX = Math.min(...allMpts.map(p => p.x));
+      const bboxMaxX = Math.max(...allMpts.map(p => p.x));
+      const bboxMinY = Math.min(...allMpts.map(p => p.y));
+      const bboxMaxY = Math.max(...allMpts.map(p => p.y));
+
+      // Sample interior at hex-width intervals
+      for (let x = bboxMinX; x <= bboxMaxX; x += hexRadiusM * 1.5) {
+        for (let y = bboxMinY; y <= bboxMaxY; y += hexRadiusM * 1.5) {
+          if (pointInPolygon(x, y, loopMetersPoints)) {
+            // Convert back to lat/lng to get actual H3 cell
+            const origin = originRef.current;
+            const latScale = 111320;
+            const lngScale = 111320 * Math.cos((origin.lat * Math.PI) / 180);
+            const sampleLat = origin.lat + y / latScale;
+            const sampleLng = origin.lng + x / lngScale;
+            const cell = h3.latLngToCell(sampleLat, sampleLng, H3_RESOLUTION);
+            enclosedCells.add(cell);
+          }
+        }
+      }
+
+      // Also add path cells that overlap the polygon (Option B)
       uniqueCellsToTest.forEach((mpt, cell) => {
         if (hexOverlapsPolygon(mpt.x, mpt.y, hexRadiusM, loopMetersPoints)) {
           enclosedCells.add(cell);
@@ -640,7 +683,14 @@ export default function RunTraceH3React() {
             <Polygon
               key={`${idx}-${poly.length}`}
               positions={poly}
-              pathOptions={{ color: routeLineColor, fillColor: routeLineColor, fillOpacity: 0.08, weight: 1.5, dashArray: "4 4" }}
+              pathOptions={{
+                color: routeLineColor,
+                fillColor: routeLineColor,
+                fillOpacity: 0.22,
+                weight: 2.5,
+                dashArray: "6 4",
+                opacity: 0.9,
+              }}
             />
           ))}
           {currentPos && <Marker position={[currentPos.lat, currentPos.lng]} icon={runnerIcon} />}
