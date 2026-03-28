@@ -1,22 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ─── Hex grid math (axial coordinates, flat-top) ───────────────────────────
-// We simulate H3 res-10 style hexagons using axial (q,r) coordinates.
-// Each hex cell is ~65m wide at res-10. We use a fixed pixel size for display.
-
-const HEX_SIZE = 18; // px, radius of each hexagon
+const HEX_SIZE = 18;
 
 function hexToId(q, r) { return `${q},${r}`; }
 function idToHex(id) { const [q, r] = id.split(",").map(Number); return { q, r }; }
 
-// Flat-top hex: pixel center from axial coords
 function hexToPixel(q, r, size = HEX_SIZE) {
   const x = size * (3 / 2) * q;
   const y = size * (Math.sqrt(3) / 2 * q + Math.sqrt(3) * r);
   return { x, y };
 }
 
-// Pixel to nearest axial hex
 function pixelToHex(px, py, size = HEX_SIZE) {
   const q = ((2 / 3) * px) / size;
   const r = ((-1 / 3) * px + (Math.sqrt(3) / 3) * py) / size;
@@ -32,13 +26,11 @@ function hexRound(qf, rf) {
   return { q, r };
 }
 
-// 6 flat-top neighbors
 const NEIGHBORS = [[1,0],[-1,0],[0,1],[0,-1],[1,-1],[-1,1]];
 function hexNeighbors(q, r) {
   return NEIGHBORS.map(([dq, dr]) => ({ q: q + dq, r: r + dr }));
 }
 
-// Flat-top corners of a hex
 function hexCorners(q, r, size = HEX_SIZE) {
   const { x: cx, y: cy } = hexToPixel(q, r, size);
   return Array.from({ length: 6 }, (_, i) => {
@@ -47,22 +39,16 @@ function hexCorners(q, r, size = HEX_SIZE) {
   });
 }
 
-// ─── Flood-fill to find interior cells of a closed polygon ring ────────────
-function floodFillInterior(ringSet, boundingCells) {
-  // bounding box of ring
+function floodFillInterior(ringSet) {
   let minQ = Infinity, maxQ = -Infinity, minR = Infinity, maxR = -Infinity;
   for (const id of ringSet) {
     const { q, r } = idToHex(id);
     if (q < minQ) minQ = q; if (q > maxQ) maxQ = q;
     if (r < minR) minR = r; if (r > maxR) maxR = r;
   }
-  // Start flood from outside corner — guaranteed exterior
   const exterior = new Set();
-  const queue = [];
-  const seed = { q: minQ - 1, r: minR - 1 };
-  const seedId = hexToId(seed.q, seed.r);
-  exterior.add(seedId);
-  queue.push(seed);
+  const queue = [{ q: minQ - 1, r: minR - 1 }];
+  exterior.add(hexToId(minQ - 1, minR - 1));
 
   while (queue.length > 0) {
     const { q, r } = queue.shift();
@@ -75,20 +61,16 @@ function floodFillInterior(ringSet, boundingCells) {
     }
   }
 
-  // Interior = cells in bounding box not in ring, not exterior
   const interior = [];
   for (let q = minQ; q <= maxQ; q++) {
     for (let r = minR; r <= maxR; r++) {
       const id = hexToId(q, r);
-      if (!ringSet.has(id) && !exterior.has(id)) {
-        interior.push(id);
-      }
+      if (!ringSet.has(id) && !exterior.has(id)) interior.push(id);
     }
   }
   return interior;
 }
 
-// ─── Score → green color ────────────────────────────────────────────────────
 function scoreToFill(score) {
   const t = Math.min(score / 6, 1);
   const r = Math.round(220 - 190 * t);
@@ -102,7 +84,6 @@ function scoreToStroke(score) {
   return `rgb(20,${g},30)`;
 }
 
-// ─── Canvas renderer ────────────────────────────────────────────────────────
 function drawHexOn(ctx, q, r, fill, stroke, strokeWidth = 0.8, size = HEX_SIZE) {
   const corners = hexCorners(q, r, size);
   ctx.beginPath();
@@ -113,67 +94,12 @@ function drawHexOn(ctx, q, r, fill, stroke, strokeWidth = 0.8, size = HEX_SIZE) 
   if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = strokeWidth; ctx.stroke(); }
 }
 
-// ─── Simulate GPS path: north/south/east/west in hex steps ─────────────────
-// 1 hex step ≈ 65m at H3 res-10 equivalent. We use ~6 steps per 200m, ~3 per 100m.
-function buildSimPath(moves) {
-  // moves: array of [dq, dr, steps]
-  let q = 0, r = 0;
-  const pts = [{ q, r }];
-  for (const [dq, dr, steps] of moves) {
-    for (let i = 0; i < steps; i++) {
-      q += dq; r += dr;
-      pts.push({ q, r });
-    }
-  }
-  return pts;
-}
-
-// Cardinal directions in flat-top axial:
-// North ≈ (0,-1), South ≈ (0,1), East ≈ (1,-1) or (1,0), West ≈ (-1,0) or (-1,1)
-const N = [0, -1], S = [0, 1], E = [1, -1], W = [-1, 1];
-
-const SCENARIOS = {
-  manual: { label: "Draw manually", info: "Click and drag on the canvas to lay a path. When you cross a previously visited cell, the circuit closes automatically." },
-  square200: {
-    label: "200m square",
-    info: "Runs a 200m N → W → S → E square. Watch the circuit close and interior cells go green.",
-    moves: [...Array(6).fill([...N,1]),...Array(6).fill([...W,1]),...Array(6).fill([...S,1]),...Array(6).fill([...E,1])].map(([dq,dr]) => [dq,dr,1])
-  },
-  innerLoop: {
-    label: "Outer + inner loop",
-    info: "200m outer square first, then a 100m inner loop on the right. Both regions score independently.",
-    phases: [
-      { moves: [...Array(6).fill([...N,1]),...Array(6).fill([...W,1]),...Array(6).fill([...S,1]),...Array(6).fill([...E,1])].map(([dq,dr])=>[dq,dr,1]), startQ: 0, startR: 0 },
-      { moves: [...Array(3).fill([...N,1]),...Array(3).fill([...E,1]),...Array(3).fill([...S,1]),...Array(3).fill([...W,1])].map(([dq,dr])=>[dq,dr,1]), startQ: 3, startR: 0 }
-    ]
-  },
-  doubleCircuit: {
-    label: "Double circuit (score ×2)",
-    info: "Same 200m square traced twice. Interior cells accumulate score=2 and become a deeper green.",
-    phases: [
-      { moves: [...Array(6).fill([...N,1]),...Array(6).fill([...W,1]),...Array(6).fill([...S,1]),...Array(6).fill([...E,1])].map(([dq,dr])=>[dq,dr,1]), startQ: 0, startR: 0 },
-      { moves: [...Array(6).fill([...N,1]),...Array(6).fill([...W,1]),...Array(6).fill([...S,1]),...Array(6).fill([...E,1])].map(([dq,dr])=>[dq,dr,1]), startQ: 0, startR: 0 }
-    ]
-  },
-  invertedC: {
-    label: "Inverted-C edge case",
-    info: "After the 200m square closes & resets, trace a U-shape going N→E→N. No circuit closes → no scoring. Open paths never score.",
-    phases: [
-      { moves: [...Array(6).fill([...N,1]),...Array(6).fill([...W,1]),...Array(6).fill([...S,1]),...Array(6).fill([...E,1])].map(([dq,dr])=>[dq,dr,1]), startQ: 0, startR: 0 },
-      { moves: [...Array(4).fill([...N,1]),...Array(4).fill([...E,1]),...Array(4).fill([...N,1])].map(([dq,dr])=>[dq,dr,1]), startQ: 0, startR: 0 }
-    ]
-  }
-};
-
-// ─── Main component ─────────────────────────────────────────────────────────
 export default function App() {
   const canvasRef = useRef(null);
   const stateRef = useRef({ path: [], scoredCells: {}, circuitCount: 0 });
   const [stats, setStats] = useState({ path: 0, circuits: 0, captured: 0, maxScore: 0 });
-  const [info, setInfo] = useState(SCENARIOS.manual.info);
-  const [activeScenario, setActiveScenario] = useState("manual");
+  const [info, setInfo] = useState("Click and drag on the canvas to lay a path. When you cross a previously visited cell, the circuit closes automatically.");
   const [flashCells, setFlashCells] = useState([]);
-  const animRef = useRef(null);
   const isDrawing = useRef(false);
 
   const updateStats = useCallback(() => {
@@ -199,13 +125,11 @@ export default function App() {
     ctx.save();
     ctx.translate(ox, oy);
 
-    // Draw scored cells
     for (const [id, score] of Object.entries(scoredCells)) {
       const { q, r } = idToHex(id);
       drawHexOn(ctx, q, r, scoreToFill(score), scoreToStroke(score), 1.0);
     }
 
-    // Draw grid background (faint)
     const gridR = 14;
     for (let q = -gridR; q <= gridR; q++) {
       for (let r = -gridR; r <= gridR; r++) {
@@ -218,8 +142,6 @@ export default function App() {
       }
     }
 
-    // Draw path
-    const pathSet = new Set(path);
     path.forEach((id, i) => {
       const { q, r } = idToHex(id);
       const isStart = i === 0;
@@ -233,7 +155,6 @@ export default function App() {
       drawHexOn(ctx, q, r, fill, stroke, isStart || isLast ? 1.5 : 0.8);
     });
 
-    // Flash cells
     flashCells.forEach(id => {
       const { q, r } = idToHex(id);
       drawHexOn(ctx, q, r, "rgba(255,255,100,0.5)", "#f1c40f", 1);
@@ -245,7 +166,6 @@ export default function App() {
 
   useEffect(() => { render(); }, [render]);
 
-  // Resize canvas
   useEffect(() => {
     const resize = () => {
       const canvas = canvasRef.current;
@@ -260,11 +180,11 @@ export default function App() {
     return () => window.removeEventListener("resize", resize);
   }, [render]);
 
-  const closeCircuit = useCallback((loopStartIdx) => {
+  const closeCircuit = useCallback((loopStartIdx, triggerCellId) => {
     const st = stateRef.current;
     const loop = st.path.slice(loopStartIdx);
     const ringSet = new Set(loop);
-    const interior = floodFillInterior(ringSet, loop);
+    const interior = floodFillInterior(ringSet);
     const newFlash = [];
     interior.forEach(id => {
       st.scoredCells[id] = (st.scoredCells[id] || 0) + 1;
@@ -274,10 +194,12 @@ export default function App() {
       st.scoredCells[id] = (st.scoredCells[id] || 0) + 1;
     });
     st.circuitCount++;
-    st.path = [];
+    // Seed the new path with the cell that triggered the closure,
+    // so the next loop starts exactly where the user currently is.
+    st.path = triggerCellId ? [triggerCellId] : [];
     setFlashCells(newFlash);
     setTimeout(() => setFlashCells([]), 500);
-    setInfo(`Circuit #${st.circuitCount} closed! ${interior.length} interior cells captured. Boundary reset ✓`);
+    setInfo(`Circuit #${st.circuitCount} closed! ${interior.length} interior cells captured. New path starts from current cell ✓`);
   }, []);
 
   const addCell = useCallback((q, r) => {
@@ -286,7 +208,7 @@ export default function App() {
     if (st.path.length > 0 && st.path[st.path.length - 1] === id) return;
     const idx = st.path.indexOf(id);
     if (idx >= 0) {
-      closeCircuit(idx);
+      closeCircuit(idx, id);
       render();
       return;
     }
@@ -334,103 +256,32 @@ export default function App() {
   }, [canvasToHex, addCell]);
 
   const resetAll = useCallback(() => {
-    if (animRef.current) clearTimeout(animRef.current);
     stateRef.current = { path: [], scoredCells: {}, circuitCount: 0 };
     setFlashCells([]);
+    setInfo("Click and drag on the canvas to lay a path. When you cross a previously visited cell, the circuit closes automatically.");
     render();
   }, [render]);
-
-  // Run scenario animation
-  const runPhase = useCallback((pts, idx, onDone) => {
-    if (idx >= pts.length) { onDone && onDone(); return; }
-    const { q, r } = pts[idx];
-    addCell(q, r);
-    animRef.current = setTimeout(() => runPhase(pts, idx + 1, onDone), 45);
-  }, [addCell]);
-
-  const setScenario = useCallback((name) => {
-    resetAll();
-    setActiveScenario(name);
-    const sc = SCENARIOS[name];
-    setInfo(sc.info);
-    if (name === "manual") return;
-
-    const runPhasesSeq = (phases, i = 0) => {
-      if (i >= phases.length) return;
-      const ph = phases[i];
-      let q = ph.startQ, r = ph.startR;
-      stateRef.current.path = [];
-      // set start cell
-      const id0 = hexToId(q, r);
-      stateRef.current.path.push(id0);
-
-      const pts = [];
-      for (const [dq, dr] of ph.moves) {
-        q += dq; r += dr;
-        pts.push({ q, r });
-      }
-      runPhase(pts, 0, () => {
-        animRef.current = setTimeout(() => runPhasesSeq(phases, i + 1), 600);
-      });
-    };
-
-    if (sc.phases) {
-      runPhasesSeq(sc.phases);
-    } else if (sc.moves) {
-      stateRef.current.path = [hexToId(0, 0)];
-      const pts = [];
-      let q = 0, r = 0;
-      for (const [dq, dr] of sc.moves) { q += dq; r += dr; pts.push({ q, r }); }
-      runPhase(pts, 0);
-    }
-  }, [resetAll, runPhase]);
 
   const scoreColors = [1, 2, 3, 4, 5, 6];
 
   return (
     <div style={{ fontFamily: "'DM Mono', 'Courier New', monospace", padding: "1rem 0", color: "#1a2733" }}>
-      {/* Header */}
-      <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
         <span style={{ fontSize: 11, letterSpacing: 2, textTransform: "uppercase", color: "#6b8099", fontWeight: 500 }}>
-          H3 Territory Capture · Axial Hex Grid
+          H3 Territory Capture · Manual Draw
         </span>
-      </div>
-
-      {/* Scenario buttons */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
-        {Object.entries(SCENARIOS).map(([key, sc]) => (
-          <button
-            key={key}
-            onClick={() => setScenario(key)}
-            style={{
-              fontSize: 12,
-              padding: "5px 13px",
-              borderRadius: 6,
-              border: activeScenario === key ? "1.5px solid #2980b9" : "1px solid #cdd8e3",
-              background: activeScenario === key ? "#ebf4fc" : "#f7f9fb",
-              color: activeScenario === key ? "#1a5c8a" : "#3d5166",
-              cursor: "pointer",
-              fontFamily: "inherit",
-              fontWeight: activeScenario === key ? 600 : 400,
-              transition: "all 0.15s"
-            }}
-          >
-            {sc.label}
-          </button>
-        ))}
         <button
           onClick={resetAll}
           style={{
             fontSize: 12, padding: "5px 13px", borderRadius: 6,
             border: "1px solid #e0b3b3", background: "#fdf0f0",
-            color: "#a33", cursor: "pointer", fontFamily: "inherit", marginLeft: "auto"
+            color: "#a33", cursor: "pointer", fontFamily: "inherit"
           }}
         >
           ↺ Reset
         </button>
       </div>
 
-      {/* Stats */}
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
         {[
           ["Path cells", stats.path],
@@ -447,7 +298,6 @@ export default function App() {
         ))}
       </div>
 
-      {/* Canvas */}
       <canvas
         ref={canvasRef}
         style={{
@@ -464,7 +314,6 @@ export default function App() {
         onTouchEnd={onMouseUp}
       />
 
-      {/* Info bar */}
       <div style={{
         marginTop: 8, fontSize: 12, color: "#5a7a96", lineHeight: 1.6,
         padding: "8px 12px", background: "#f0f6fb", borderRadius: 7, border: "1px solid #d0e4f0"
@@ -472,7 +321,6 @@ export default function App() {
         {info}
       </div>
 
-      {/* Legend */}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 10, alignItems: "center", fontSize: 11, color: "#6b8099" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
           <div style={{ width: 14, height: 14, borderRadius: 3, background: "rgba(230,80,80,0.55)", border: "1.5px solid #c0392b" }} />
